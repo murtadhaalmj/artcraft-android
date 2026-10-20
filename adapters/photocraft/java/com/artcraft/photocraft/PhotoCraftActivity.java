@@ -65,6 +65,24 @@ public final class PhotoCraftActivity extends GameActivity {
     private EditText imeView;
     // True between imeShow() and imeHide(); suppresses a deferred show that a quick hide overtook.
     private volatile boolean imeWanted = false;
+    // True while an on-screen Ctrl/Alt is armed: letters are committed at once instead of being held
+    // as a composing word, so each one can become a shortcut key press in the Rust shell.
+    private volatile boolean shortcutMode = false;
+
+    /** Called by the Rust shell via JNI when the on-screen Ctrl/Alt arms or disarms. */
+    public void imeSetShortcutMode(boolean on) {
+        shortcutMode = on;
+        final EditText view = imeView;
+        if (view != null) {
+            view.post(() -> {
+                try {
+                    android.view.inputmethod.InputMethodManager imm =
+                            (android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+                    if (imm != null) imm.restartInput(view);
+                } catch (Throwable ignored) { }
+            });
+        }
+    }
 
     // Documents the system asked this app to open (an ACTION_VIEW/ACTION_SEND it is registered for):
     // the private path of each staged copy, drained one per call by the Rust shell through
@@ -195,6 +213,10 @@ public final class PhotoCraftActivity extends GameActivity {
 
                         @Override
                         public boolean setComposingText(CharSequence text, int newCursorPosition) {
+                            if (shortcutMode && text != null && text.length() > 0) {
+                                imeEvents.offer("c" + text);
+                                return super.commitText(text, newCursorPosition);
+                            }
                             imeEvents.offer("p" + (text == null ? "" : text.toString()));
                             return super.setComposingText(text, newCursorPosition);
                         }
