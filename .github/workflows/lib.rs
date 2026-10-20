@@ -587,6 +587,16 @@ struct ShortcutBar {
     /// Soft keyboard requested from the bar (true = show, false = hide); handled next frame.
     kb_request: Option<bool>,
     kb_on: bool,
+    /// One-shot "right-click" armed from the bar: the next tap becomes a secondary click.
+    rc_once: bool,
+    /// Long-press right-click is on unless switched off from the bar.
+    long_press_off: bool,
+    /// Primary press being watched for a long press: where and since when.
+    press: Option<(egui::Pos2, std::time::Instant)>,
+    /// A long press already fired for the current touch (its real release is dropped).
+    press_fired: bool,
+    /// The current primary press was turned into a secondary one; convert its release too.
+    rc_release: bool,
     /// Last modifier state announced to egui.
     last: egui::Modifiers,
 }
@@ -662,6 +672,16 @@ impl ShortcutBar {
                             self.kb_on = !self.kb_on;
                             self.kb_request = Some(self.kb_on);
                         }
+                        if ui.selectable_label(self.rc_once, "RC").clicked() {
+                            self.rc_once = !self.rc_once;
+                        }
+                        if ui
+                            .selectable_label(!self.long_press_off, "LP")
+                            .clicked()
+                        {
+                            self.long_press_off = !self.long_press_off;
+                            self.press = None;
+                        }
                         ui.separator();
                         for (label, key) in [
                             ("Esc", egui::Key::Escape),
@@ -696,7 +716,7 @@ impl ShortcutBar {
                 self.alt = Sticky::Off;
             }
         }
-        if self.kb_request.is_some() || !self.pending.is_empty() || self.ctrl.on() || self.shift.on() || self.alt.on() {
+        if self.kb_request.is_some() || self.press.is_some() || !self.pending.is_empty() || self.ctrl.on() || self.shift.on() || self.alt.on() {
             ctx.request_repaint();
         }
     }
@@ -808,14 +828,45 @@ fn apply_virtual_modifiers(bar: &mut ShortcutBar, physical: egui::Modifiers, raw
             }
             egui::Event::PointerButton {
                 pos,
+                button,
                 pressed,
                 modifiers,
                 ..
             } => {
                 *modifiers = or_mods(*modifiers, virt);
                 let on_bar = bar.rect.is_some_and(|r| r.contains(*pos));
+                if *button == egui::PointerButton::Primary {
+                    if *pressed && !on_bar {
+                        bar.press_fired = false;
+                        if bar.rc_once {
+                            // "RC": this tap is a right-click.
+                            bar.rc_once = false;
+                            bar.rc_release = true;
+                            *button = egui::PointerButton::Secondary;
+                        } else if !bar.long_press_off {
+                            bar.press = Some((*pos, std::time::Instant::now()));
+                        }
+                    } else if !*pressed {
+                        bar.press = None;
+                        if bar.rc_release {
+                            bar.rc_release = false;
+                            *button = egui::PointerButton::Secondary;
+                        } else if bar.press_fired {
+                            // The long press already sent its own click; drop the real release.
+                            bar.press_fired = false;
+                            continue;
+                        }
+                    }
+                }
                 if *pressed && !on_bar && (virt.ctrl || virt.alt || virt.shift) {
                     consumed = true;
+                }
+            }
+            egui::Event::PointerMoved(p) => {
+                if let Some((start, _)) = bar.press {
+                    if (*p - start).length() > 14.0 {
+                        bar.press = None;
+                    }
                 }
             }
             egui::Event::MouseWheel { modifiers, .. } => {
@@ -824,6 +875,25 @@ fn apply_virtual_modifiers(bar: &mut ShortcutBar, physical: egui::Modifiers, raw
             _ => {}
         }
         out.push(event);
+    }
+    if let Some((pos, since)) = bar.press {
+        if since.elapsed() >= std::time::Duration::from_millis(550) {
+            bar.press = None;
+            bar.press_fired = true;
+            let m = or_mods(physical, bar.virtual_mods());
+            for (button, pressed) in [
+                (egui::PointerButton::Primary, false),
+                (egui::PointerButton::Secondary, true),
+                (egui::PointerButton::Secondary, false),
+            ] {
+                out.push(egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers: m,
+                });
+            }
+        }
     }
     raw.events = out;
 
@@ -991,6 +1061,9 @@ impl eframe::App for PhotoCraftAndroidApp {
         self.ime.poll(raw);
         apply_android_modifiers(&mut self.modifiers, raw);
         apply_virtual_modifiers(&mut self.shortcuts, self.modifiers, raw);
+        if self.shortcuts.press.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
         if let Some(show) = self.shortcuts.kb_request.take() {
             if show {
                 self.bridge.app.show_soft_input(false);
