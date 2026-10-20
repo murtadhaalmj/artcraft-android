@@ -6,9 +6,13 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - name: Check the adapter file is the new one
+      - name: Install the new PhotoCraft adapter files
         run: |
-          grep -q "long_press_off" adapters/photocraft/src/lib.rs || { echo "WRONG lib.rs: the new PhotoCraft adapter was not uploaded"; exit 1; }
+          test -f photocraft_adapter.rs || { echo "MISSING photocraft_adapter.rs in the repository root"; exit 1; }
+          cp photocraft_adapter.rs adapters/photocraft/src/lib.rs
+          if [ -f PhotoCraftActivity.java ]; then cp PhotoCraftActivity.java adapters/photocraft/java/com/artcraft/photocraft/PhotoCraftActivity.java; fi
+          grep -q "long_press_off" adapters/photocraft/src/lib.rs || { echo "WRONG photocraft_adapter.rs: it is not the new file"; exit 1; }
+          head -1 adapters/photocraft/src/lib.rs
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
