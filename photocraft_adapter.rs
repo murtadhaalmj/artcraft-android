@@ -551,6 +551,285 @@ fn apply_android_modifiers(state: &mut egui::Modifiers, raw: &mut egui::RawInput
 // tap twice = locked; tap again = off. With Ctrl/Alt armed, a Latin letter typed on the soft
 // keyboard becomes a real shortcut key press (Ctrl+Z, Ctrl+Shift+S, Alt+...).
 // ---------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------
+// Touchpad mode ("TP" in the bar), like Chrome Remote Desktop's trackpad: a virtual mouse cursor is
+// drawn and your finger moves it from anywhere on the screen.
+//   one finger drag ........ move the cursor
+//   tap .................... left click at the cursor
+//   tap, then touch and drag  press and drag with the left button (draw, move, select)
+//   hold still (~0.55 s) ... right click
+//   two-finger tap ......... right click
+//   two-finger drag ........ scroll (the wheel) under the cursor
+//   two-finger pinch ....... zoom
+// A touch that starts on the shortcut bar goes straight through, so its buttons stay tappable.
+// ---------------------------------------------------------------------------------------------
+const PAD_SLOP: f32 = 10.0;
+const PAD_TAP_MS: u128 = 300;
+const PAD_LONG_MS: u128 = 550;
+const PAD_SENSITIVITY: f32 = 1.6;
+
+#[derive(Default)]
+struct TouchPad {
+    enabled: bool,
+    cursor: egui::Pos2,
+    screen: Option<egui::Rect>,
+    /// Active touches: (id, start, current).
+    touches: Vec<(u64, egui::Pos2, egui::Pos2)>,
+    /// The current touch began on the shortcut bar and is passed through untouched.
+    direct: bool,
+    started: Option<std::time::Instant>,
+    moved: bool,
+    long_fired: bool,
+    /// More than one finger was down during this gesture (no click on the last lift).
+    multi: bool,
+    dragging: bool,
+    last_tap: Option<std::time::Instant>,
+    two_started: Option<std::time::Instant>,
+    two_moved: f32,
+    prev_dist: f32,
+    prev_mid: egui::Pos2,
+    zoomed: bool,
+}
+
+impl TouchPad {
+    fn reset(&mut self) {
+        let enabled = self.enabled;
+        let cursor = self.cursor;
+        let screen = self.screen;
+        *self = TouchPad::default();
+        self.enabled = enabled;
+        self.cursor = cursor;
+        self.screen = screen;
+    }
+
+    fn clamp(&self, p: egui::Pos2) -> egui::Pos2 {
+        match self.screen {
+            Some(r) => egui::pos2(p.x.clamp(r.left(), r.right()), p.y.clamp(r.top(), r.bottom())),
+            None => p,
+        }
+    }
+
+    fn paint(&self, ctx: &egui::Context) {
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("photocraft_touchpad_cursor"),
+        ));
+        let c = self.cursor;
+        let points = vec![
+            c,
+            c + egui::vec2(0.0, 22.0),
+            c + egui::vec2(15.0, 16.0),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            points,
+            egui::Color32::WHITE,
+            egui::Stroke::new(1.6, egui::Color32::BLACK),
+        ));
+    }
+}
+
+fn pointer_button(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    }
+}
+
+fn pad_click(out: &mut Vec<egui::Event>, pos: egui::Pos2, button: egui::PointerButton) {
+    out.push(egui::Event::PointerMoved(pos));
+    out.push(pointer_button(pos, button, true));
+    out.push(pointer_button(pos, button, false));
+}
+
+/// Replace this frame's raw touch/pointer events with the touchpad's synthetic mouse events.
+fn pad_process(
+    pad: &mut TouchPad,
+    events: Vec<egui::Event>,
+    bar_rect: Option<egui::Rect>,
+    now: std::time::Instant,
+) -> Vec<egui::Event> {
+    let mut out: Vec<egui::Event> = Vec::with_capacity(events.len() + 4);
+    for event in events {
+        match event {
+            egui::Event::Touch { id, phase, pos, .. } => {
+                let id = id.0;
+                match phase {
+                    egui::TouchPhase::Start => {
+                        if pad.touches.is_empty()
+                            && bar_rect.is_some_and(|r| r.contains(pos))
+                        {
+                            pad.direct = true;
+                            continue;
+                        }
+                        if pad.direct {
+                            continue;
+                        }
+                        pad.touches.push((id, pos, pos));
+                        match pad.touches.len() {
+                            1 => {
+                                pad.started = Some(now);
+                                pad.moved = false;
+                                pad.long_fired = false;
+                                pad.multi = false;
+                                let quick_second = pad
+                                    .last_tap
+                                    .is_some_and(|t| now.duration_since(t).as_millis() < PAD_TAP_MS);
+                                pad.last_tap = None;
+                                if quick_second {
+                                    pad.dragging = true;
+                                    out.push(egui::Event::PointerMoved(pad.cursor));
+                                    out.push(pointer_button(
+                                        pad.cursor,
+                                        egui::PointerButton::Primary,
+                                        true,
+                                    ));
+                                }
+                            }
+                            2 => {
+                                pad.multi = true;
+                                if pad.dragging {
+                                    pad.dragging = false;
+                                    out.push(pointer_button(
+                                        pad.cursor,
+                                        egui::PointerButton::Primary,
+                                        false,
+                                    ));
+                                }
+                                pad.two_started = Some(now);
+                                pad.two_moved = 0.0;
+                                let (a, b) = (pad.touches[0].2, pad.touches[1].2);
+                                pad.prev_dist = (a - b).length().max(1.0);
+                                pad.prev_mid = a + (b - a) * 0.5;
+                            }
+                            _ => {}
+                        }
+                    }
+                    egui::TouchPhase::Move => {
+                        if pad.direct {
+                            continue;
+                        }
+                        let Some(i) = pad.touches.iter().position(|t| t.0 == id) else {
+                            continue;
+                        };
+                        let old = pad.touches[i].2;
+                        pad.touches[i].2 = pos;
+                        let start = pad.touches[i].1;
+                        if pad.touches.len() == 1 {
+                            if (pos - start).length() > PAD_SLOP {
+                                pad.moved = true;
+                            }
+                            let next = pad.clamp(pad.cursor + (pos - old) * PAD_SENSITIVITY);
+                            if next != pad.cursor {
+                                pad.cursor = next;
+                                out.push(egui::Event::PointerMoved(next));
+                            }
+                        } else if pad.touches.len() == 2 {
+                            let (a, b) = (pad.touches[0].2, pad.touches[1].2);
+                            let dist = (a - b).length().max(1.0);
+                            let mid = a + (b - a) * 0.5;
+                            let mid_delta = mid - pad.prev_mid;
+                            let dist_delta = dist - pad.prev_dist;
+                            pad.two_moved += mid_delta.length() + dist_delta.abs();
+                            if dist_delta.abs() > mid_delta.length() {
+                                let ratio = dist / pad.prev_dist;
+                                if (ratio - 1.0).abs() > 0.002 {
+                                    out.push(egui::Event::PointerMoved(mid));
+                                    out.push(egui::Event::Zoom(ratio));
+                                    pad.zoomed = true;
+                                }
+                            } else if mid_delta.length() > 0.2 {
+                                out.push(egui::Event::PointerMoved(pad.cursor));
+                                out.push(egui::Event::MouseWheel {
+                                    unit: egui::MouseWheelUnit::Point,
+                                    delta: mid_delta,
+                                    phase: egui::TouchPhase::Move,
+                                    modifiers: egui::Modifiers::default(),
+                                });
+                            }
+                            pad.prev_dist = dist;
+                            pad.prev_mid = mid;
+                        }
+                    }
+                    egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                        let ended = phase == egui::TouchPhase::End;
+                        if pad.direct {
+                            // Cleared by the PointerGone that follows.
+                            continue;
+                        }
+                        let count = pad.touches.len();
+                        if count == 1 {
+                            if pad.dragging {
+                                pad.dragging = false;
+                                out.push(pointer_button(
+                                    pad.cursor,
+                                    egui::PointerButton::Primary,
+                                    false,
+                                ));
+                            } else if ended
+                                && !pad.moved
+                                && !pad.multi
+                                && !pad.long_fired
+                                && pad.started.is_some_and(|t| {
+                                    now.duration_since(t).as_millis() < PAD_TAP_MS
+                                })
+                            {
+                                pad_click(&mut out, pad.cursor, egui::PointerButton::Primary);
+                                pad.last_tap = Some(now);
+                            }
+                        } else if count == 2
+                            && ended
+                            && pad.two_moved < PAD_SLOP
+                            && pad.two_started.is_some_and(|t| {
+                                now.duration_since(t).as_millis() < PAD_TAP_MS
+                            })
+                        {
+                            pad_click(&mut out, pad.cursor, egui::PointerButton::Secondary);
+                        }
+                        pad.touches.retain(|t| t.0 != id);
+                        if pad.zoomed && pad.touches.len() < 2 {
+                            pad.zoomed = false;
+                            out.push(egui::Event::PointerMoved(pad.cursor));
+                        }
+                        if pad.touches.is_empty() {
+                            pad.started = None;
+                            pad.multi = false;
+                            pad.moved = false;
+                        }
+                    }
+                }
+            }
+            egui::Event::PointerGone if pad.direct => {
+                pad.direct = false;
+                out.push(egui::Event::PointerGone);
+            }
+            egui::Event::PointerMoved(_)
+            | egui::Event::PointerButton { .. }
+            | egui::Event::PointerGone => {
+                if pad.direct {
+                    out.push(event);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    // Hold still: right click.
+    if pad.touches.len() == 1
+        && !pad.moved
+        && !pad.multi
+        && !pad.dragging
+        && !pad.long_fired
+        && pad
+            .started
+            .is_some_and(|t| now.duration_since(t).as_millis() >= PAD_LONG_MS)
+    {
+        pad.long_fired = true;
+        pad_click(&mut out, pad.cursor, egui::PointerButton::Secondary);
+    }
+    out
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Sticky {
     #[default]
@@ -599,6 +878,7 @@ struct ShortcutBar {
     rc_release: bool,
     /// Last modifier state announced to egui.
     last: egui::Modifiers,
+    pad: TouchPad,
 }
 
 fn or_mods(a: egui::Modifiers, b: egui::Modifiers) -> egui::Modifiers {
@@ -672,6 +952,13 @@ impl ShortcutBar {
                             self.kb_on = !self.kb_on;
                             self.kb_request = Some(self.kb_on);
                         }
+                        if ui.selectable_label(self.pad.enabled, "TP").clicked() {
+                            self.pad.enabled = !self.pad.enabled;
+                            self.pad.reset();
+                            if self.pad.enabled {
+                                self.pad.cursor = screen.center();
+                            }
+                        }
                         if ui.selectable_label(self.rc_once, "RC").clicked() {
                             self.rc_once = !self.rc_once;
                         }
@@ -704,6 +991,10 @@ impl ShortcutBar {
                 });
             });
         self.rect = Some(area.response.rect);
+        self.pad.screen = Some(screen);
+        if self.pad.enabled {
+            self.pad.paint(ctx);
+        }
         if toggle {
             self.open = !self.open;
             if !self.open {
@@ -716,7 +1007,7 @@ impl ShortcutBar {
                 self.alt = Sticky::Off;
             }
         }
-        if self.kb_request.is_some() || self.press.is_some() || !self.pending.is_empty() || self.ctrl.on() || self.shift.on() || self.alt.on() {
+        if self.kb_request.is_some() || self.press.is_some() || !self.pad.touches.is_empty() || !self.pending.is_empty() || self.ctrl.on() || self.shift.on() || self.alt.on() {
             ctx.request_repaint();
         }
     }
@@ -767,6 +1058,10 @@ fn is_modifier_key(key: egui::Key) -> bool {
 /// Merge the on-screen modifiers into this frame's events (run after `apply_android_modifiers`,
 /// with the physical keyboard's state in `physical`).
 fn apply_virtual_modifiers(bar: &mut ShortcutBar, physical: egui::Modifiers, raw: &mut egui::RawInput) {
+    if bar.pad.enabled {
+        let events = std::mem::take(&mut raw.events);
+        raw.events = pad_process(&mut bar.pad, events, bar.rect, std::time::Instant::now());
+    }
     let virt = bar.virtual_mods();
     let had_mod_event = raw
         .events
@@ -843,7 +1138,7 @@ fn apply_virtual_modifiers(bar: &mut ShortcutBar, physical: egui::Modifiers, raw
                             bar.rc_once = false;
                             bar.rc_release = true;
                             *button = egui::PointerButton::Secondary;
-                        } else if !bar.long_press_off {
+                        } else if !bar.long_press_off && !bar.pad.enabled {
                             bar.press = Some((*pos, std::time::Instant::now()));
                         }
                     } else if !*pressed {
@@ -1061,7 +1356,7 @@ impl eframe::App for PhotoCraftAndroidApp {
         self.ime.poll(raw);
         apply_android_modifiers(&mut self.modifiers, raw);
         apply_virtual_modifiers(&mut self.shortcuts, self.modifiers, raw);
-        if self.shortcuts.press.is_some() {
+        if self.shortcuts.press.is_some() || !self.shortcuts.pad.touches.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         if let Some(show) = self.shortcuts.kb_request.take() {
